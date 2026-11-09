@@ -57,9 +57,38 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        if let Err(err) = session.push_audio(&pcm, 16_000) {
-            eprintln!("{err}");
-            return ExitCode::from(1);
+        // Feed the file in short windows. A partial has to show up before the
+        // last window is pushed. Release only commits; it does not decode again.
+        let chunk = 16_000 * 2;
+        let mut offset = 0;
+        let mut saw_partial = false;
+        while offset < pcm.len() {
+            let end = (offset + chunk).min(pcm.len());
+            let last = end == pcm.len();
+            if last && saw_partial {
+                println!("partial arrived before the final chunk");
+            }
+            if let Err(err) = session.push_audio(&pcm[offset..end], 16_000) {
+                eprintln!("{err}");
+                return ExitCode::from(1);
+            }
+            offset = end;
+            if last {
+                break;
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            while !saw_partial && std::time::Instant::now() < deadline {
+                if print_updates(&session) {
+                    saw_partial = true;
+                }
+                if !saw_partial {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+            }
+            if !saw_partial {
+                eprintln!("no partial before the rest of the file");
+                return ExitCode::from(1);
+            }
         }
         if let Err(err) = session.stop_listening() {
             eprintln!("{err}");
@@ -97,8 +126,12 @@ fn main() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn print_updates(session: &Clack) {
+fn print_updates(session: &Clack) -> bool {
+    let mut saw_partial = false;
     for update in session.poll() {
+        if !update.is_final && !update.cancelled && !update.text.is_empty() {
+            saw_partial = true;
+        }
         println!(
             "{} {}{}",
             if update.is_final { "final" } else { "partial" },
@@ -106,6 +139,7 @@ fn print_updates(session: &Clack) {
             update.text
         );
     }
+    saw_partial
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -118,7 +152,8 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn read_wav_mono_16k(path: &str) -> Result<Vec<f32>, String> {
     let mut file = File::open(path).map_err(|err| format!("{path}: {err}"))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|err| err.to_string())?;
+    file.read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(format!("{path} is not a PCM wav"));
     }

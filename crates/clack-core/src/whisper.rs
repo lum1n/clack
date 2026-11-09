@@ -1,6 +1,6 @@
-//! Whisper-family loader. Audio is zero-padded to the 30 second window the
-//! encoder was trained on. Trailing silence is what makes the decoder emit
-//! end-of-transcript. Only `model.safetensors` (one file or a shard index) is read.
+//! Whisper-family loader. A window is the audio so far plus a short tail, not a
+//! padded 30 second chunk, so a partial can finish while the speaker is still
+//! talking. Only `model.safetensors` (one file or a shard index) is read.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -8,8 +8,8 @@ use std::path::Path;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{
-    self, Config, DTYPE, EOT_TOKEN, HOP_LENGTH, N_FFT, N_FRAMES, N_SAMPLES, NO_SPEECH_TOKENS,
-    NO_TIMESTAMPS_TOKEN, SAMPLE_RATE, SOT_TOKEN, TRANSCRIBE_TOKEN, TRANSLATE_TOKEN,
+    self, Config, DTYPE, EOT_TOKEN, HOP_LENGTH, NO_SPEECH_TOKENS, NO_TIMESTAMPS_TOKEN, N_FFT,
+    N_FRAMES, N_SAMPLES, SAMPLE_RATE, SOT_TOKEN, TRANSCRIBE_TOKEN, TRANSLATE_TOKEN,
 };
 use hf_hub::{HFClient, HFClientSync};
 use rustfft::num_complex::Complex;
@@ -22,6 +22,11 @@ use crate::language::LanguageMode;
 use crate::model::{Hypothesis, SpeechModel};
 
 const N_FREQ: usize = N_FFT / 2 + 1;
+/// Silence after the real samples so the decoder can end the phrase.
+/// A full 30s pad makes a short window look like silence and costs a full encode.
+const TAIL_SAMPLES: usize = SAMPLE_RATE / 2;
+/// Mean square above this is speech, so `<|nospeech|>` is not allowed to win.
+const SPEECH_MEAN_SQUARE: f32 = 1.0e-4;
 
 pub struct WhisperModel {
     model: whisper::model::Whisper,
@@ -32,7 +37,11 @@ pub struct WhisperModel {
 }
 
 impl SpeechModel for WhisperModel {
-    fn transcribe(&mut self, pcm_16k_mono: &[f32], language: &LanguageMode) -> ClackResult<Hypothesis> {
+    fn transcribe(
+        &mut self,
+        pcm_16k_mono: &[f32],
+        language: &LanguageMode,
+    ) -> ClackResult<Hypothesis> {
         if pcm_16k_mono.len() < 1_600 {
             return Ok(Hypothesis {
                 text: String::new(),
@@ -46,10 +55,19 @@ impl SpeechModel for WhisperModel {
         } else {
             pcm_16k_mono
         };
-        let mel = log_mel(pcm, self.model.config.num_mel_bins, &self.filters, self.fft.as_ref())?;
+        let mel = log_mel(
+            pcm,
+            self.model.config.num_mel_bins,
+            &self.filters,
+            self.fft.as_ref(),
+        )?;
         let frames = mel.len() / self.model.config.num_mel_bins.max(1);
-        let input = Tensor::from_vec(mel, (1, self.model.config.num_mel_bins, frames), &self.device)
-            .map_err(model_err)?;
+        let input = Tensor::from_vec(
+            mel,
+            (1, self.model.config.num_mel_bins, frames),
+            &self.device,
+        )
+        .map_err(model_err)?;
         self.model.reset_kv_cache();
         let encoded = self
             .model
@@ -69,7 +87,9 @@ impl SpeechModel for WhisperModel {
             }
             LanguageMode::Code(code) => (code.clone(), false),
         };
-        let text = self.decode(&encoded, &code, translate)?;
+        let speech = mean_square(pcm) >= SPEECH_MEAN_SQUARE;
+        let steps = decode_steps(pcm.len());
+        let text = self.decode(&encoded, &code, translate, speech, steps)?;
         Ok(Hypothesis {
             text,
             language: Some(code),
@@ -95,7 +115,10 @@ impl WhisperModel {
             let Some(id) = self.tokenizer.token_to_id(&format!("<|{}|>", option.code)) else {
                 continue;
             };
-            let score = logits.get(id as usize).copied().unwrap_or(f32::NEG_INFINITY);
+            let score = logits
+                .get(id as usize)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
             if score > best {
                 best = score;
                 best_code = option.code.to_string();
@@ -104,11 +127,22 @@ impl WhisperModel {
         Ok(best_code)
     }
 
-    fn decode(&mut self, encoded: &Tensor, language: &str, translate: bool) -> ClackResult<String> {
+    fn decode(
+        &mut self,
+        encoded: &Tensor,
+        language: &str,
+        translate: bool,
+        speech: bool,
+        max_steps: usize,
+    ) -> ClackResult<String> {
         let mut ids = vec![
             self.token_id(SOT_TOKEN)?,
             self.token_id(&format!("<|{language}|>"))?,
-            self.token_id(if translate { TRANSLATE_TOKEN } else { TRANSCRIBE_TOKEN })?,
+            self.token_id(if translate {
+                TRANSLATE_TOKEN
+            } else {
+                TRANSCRIBE_TOKEN
+            })?,
             self.token_id(NO_TIMESTAMPS_TOKEN)?,
         ];
         let eot = self.token_id(EOT_TOKEN)?;
@@ -126,7 +160,7 @@ impl WhisperModel {
             .and_then(|encoding| encoding.get_ids().first().copied());
         let prompt_len = ids.len();
         self.model.reset_kv_cache();
-        for _ in 0..96 {
+        for _ in 0..max_steps {
             let tokens = Tensor::new(ids.as_slice(), &self.device)
                 .map_err(model_err)?
                 .unsqueeze(0)
@@ -140,6 +174,13 @@ impl WhisperModel {
             if let Some(id) = blank {
                 if let Some(slot) = logits.get_mut(id as usize) {
                     *slot = f32::NEG_INFINITY;
+                }
+            }
+            if speech {
+                for id in &no_speech {
+                    if let Some(slot) = logits.get_mut(*id as usize) {
+                        *slot = f32::NEG_INFINITY;
+                    }
                 }
             }
             for (index, score) in logits.iter_mut().enumerate() {
@@ -166,7 +207,12 @@ impl WhisperModel {
             // Two copies of a token are enough. A third is the repetition loop.
             mask_repeated_tokens(&mut logits, spoken);
             let next = argmax(&logits);
-            if !logits.get(next).copied().unwrap_or(f32::NEG_INFINITY).is_finite() {
+            if !logits
+                .get(next)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY)
+                .is_finite()
+            {
                 break;
             }
             if spoken.is_empty() && no_speech.contains(&(next as u32)) {
@@ -176,6 +222,9 @@ impl WhisperModel {
                 break;
             }
             ids.push(next as u32);
+            if spoken_loops(&ids[prompt_len..]) {
+                break;
+            }
         }
         let spoken: Vec<u32> = ids[prompt_len..]
             .iter()
@@ -217,9 +266,9 @@ impl WhisperModel {
     }
 
     fn token_id(&self, token: &str) -> ClackResult<u32> {
-        self.tokenizer.token_to_id(token).ok_or_else(|| {
-            ClackError::Model(format!("tokenizer is missing {token}"))
-        })
+        self.tokenizer
+            .token_to_id(token)
+            .ok_or_else(|| ClackError::Model(format!("tokenizer is missing {token}")))
     }
 }
 
@@ -240,8 +289,11 @@ pub fn load_whisper(
     let config_json = std::fs::read_to_string(&config_path)
         .map_err(|err| ClackError::Model(format!("reading config.json: {err}")))?;
     classify_hub_config(repo_id, &config_json)?;
-    let config: Config = serde_json::from_str(&config_json)
-        .map_err(|err| ClackError::Model(format!("{repo_id} config.json is not a Whisper config: {err}")))?;
+    let config: Config = serde_json::from_str(&config_json).map_err(|err| {
+        ClackError::Model(format!(
+            "{repo_id} config.json is not a Whisper config: {err}"
+        ))
+    })?;
 
     report(0.16, "Downloading tokenizer");
     let tokenizer_path = repo
@@ -258,8 +310,9 @@ pub fn load_whisper(
     report(0.94, "Loading weights");
     let device = Device::Cpu;
     let vb = VarBuilder::from_tensors(tensors, DTYPE, &device);
-    let model = whisper::model::Whisper::load(&vb, config)
-        .map_err(|err| ClackError::Model(format!("{repo_id} weights did not load as Whisper: {err}")))?;
+    let model = whisper::model::Whisper::load(&vb, config).map_err(|err| {
+        ClackError::Model(format!("{repo_id} weights did not load as Whisper: {err}"))
+    })?;
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(N_FFT);
     let filters = mel_filters(model.config.num_mel_bins, SAMPLE_RATE, N_FFT);
@@ -282,7 +335,9 @@ fn download_weights(
         Ok(path) => return load_safetensors(&path, &device),
         Err(err) => {
             let text = err.to_string().to_lowercase();
-            let missing = text.contains("404") || text.contains("not found") || text.contains("entry not found");
+            let missing = text.contains("404")
+                || text.contains("not found")
+                || text.contains("entry not found");
             if !missing {
                 return Err(hub_err(err));
             }
@@ -336,15 +391,18 @@ fn load_safetensors(path: &Path, device: &Device) -> ClackResult<HashMap<String,
     candle_core::safetensors::load(path, device).map_err(|err| {
         ClackError::Model(format!(
             "reading {}: {err}",
-            path.file_name().and_then(|name| name.to_str()).unwrap_or("safetensors")
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("safetensors")
         ))
     })
 }
 
 fn prefix_model_keys(tensors: HashMap<String, Tensor>) -> HashMap<String, Tensor> {
-    let needs_prefix = tensors.keys().any(|key| {
-        key.starts_with("encoder.") || key.starts_with("decoder.")
-    }) && !tensors.keys().any(|key| key.starts_with("model."));
+    let needs_prefix = tensors
+        .keys()
+        .any(|key| key.starts_with("encoder.") || key.starts_with("decoder."))
+        && !tensors.keys().any(|key| key.starts_with("model."));
     if !needs_prefix {
         return tensors;
     }
@@ -430,7 +488,67 @@ fn argmax(values: &[f32]) -> usize {
 }
 
 fn normalize_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let words: Vec<&str> = text.split_whitespace().collect();
+    collapse_looped_phrase(&words)
+}
+
+/// "ask not ask not" is one phrase said twice. Keep the first copy.
+fn collapse_looped_phrase(words: &[&str]) -> String {
+    if words.len() >= 2 {
+        for period in 1..=words.len() / 2 {
+            if words.len() % period != 0 {
+                continue;
+            }
+            let times = words.len() / period;
+            if times < 2 || (period == 1 && times < 3) {
+                continue;
+            }
+            let repeated = (0..period)
+                .all(|index| (1..times).all(|copy| words[index] == words[copy * period + index]));
+            if repeated {
+                return words[..period].join(" ");
+            }
+        }
+    }
+    words.join(" ")
+}
+
+/// The last tokens are the same phrase twice (or one token three times).
+fn spoken_loops(spoken: &[u32]) -> bool {
+    let count = spoken.len();
+    for period in 1..=count / 2 {
+        let copies = if period == 1 { 3 } else { 2 };
+        if count < period * copies {
+            continue;
+        }
+        let start = count - period * copies;
+        let unit = &spoken[start..start + period];
+        let mut same = true;
+        for copy in 1..copies {
+            let piece = &spoken[start + copy * period..start + (copy + 1) * period];
+            if piece != unit {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            return true;
+        }
+    }
+    false
+}
+
+fn mean_square(pcm: &[f32]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    pcm.iter().map(|sample| sample * sample).sum::<f32>() / pcm.len() as f32
+}
+
+/// Enough tokens for the words in this window, not a 96-step ramble into the tail.
+fn decode_steps(samples: usize) -> usize {
+    let seconds = samples as f32 / SAMPLE_RATE as f32;
+    ((seconds * 8.0).ceil() as usize).clamp(8, 96)
 }
 
 fn log_mel(
@@ -446,17 +564,23 @@ fn log_mel(
             n_mels
         )));
     }
-    // Pad or trim to Whisper's fixed 30s chunk. A short mel has no trailing
-    // silence, so greedy decode never selects end-of-transcript and repeats.
+    // Keep the real audio and a short tail. Padding out to 30s makes the encoder
+    // do a full chunk for every partial, and the decoder then calls the window silence.
     let mut pcm = samples.to_vec();
-    if pcm.len() < N_SAMPLES {
-        pcm.resize(N_SAMPLES, 0.0);
-    } else if pcm.len() > N_SAMPLES {
+    if pcm.len() > N_SAMPLES {
         pcm.truncate(N_SAMPLES);
+    } else {
+        let room = N_SAMPLES - pcm.len();
+        pcm.resize(pcm.len() + TAIL_SAMPLES.min(room), 0.0);
+    }
+    let remainder = pcm.len() % HOP_LENGTH;
+    if remainder != 0 && pcm.len() + (HOP_LENGTH - remainder) <= N_SAMPLES {
+        pcm.resize(pcm.len() + (HOP_LENGTH - remainder), 0.0);
     }
     // torch.stft(center=True) reflect-pads N_FFT/2 on each side, then Whisper
-    // drops the last frame, leaving N_FRAMES for a 30s chunk.
-    let frames = N_FRAMES;
+    // drops the last frame. For a 30s chunk that is N_FRAMES. A partial uses
+    // only the frames this audio actually occupies.
+    let frames = (pcm.len() / HOP_LENGTH).clamp(1, N_FRAMES);
     let padded = reflect_pad(&pcm, N_FFT / 2);
     let mut hann = vec![0.0_f32; N_FFT];
     for (index, window) in hann.iter_mut().enumerate() {
@@ -495,7 +619,10 @@ fn log_mel(
 }
 
 fn is_timestamp(token: &str) -> bool {
-    let Some(inner) = token.strip_prefix("<|").and_then(|token| token.strip_suffix("|>")) else {
+    let Some(inner) = token
+        .strip_prefix("<|")
+        .and_then(|token| token.strip_suffix("|>"))
+    else {
         return false;
     };
     let Some((seconds, fraction)) = inner.split_once('.') else {
@@ -588,7 +715,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mel_of_one_second_is_padded_to_thirty_seconds() {
+    fn mel_of_one_second_stays_a_short_window() {
         let filters = mel_filters(80, SAMPLE_RATE, N_FFT);
         assert_eq!(filters.len(), 80 * N_FREQ);
         assert!(filters.iter().any(|value| *value > 0.0));
@@ -596,18 +723,41 @@ mod tests {
         let fft = planner.plan_fft_forward(N_FFT);
         let pcm = vec![0.0_f32; SAMPLE_RATE];
         let mel = log_mel(&pcm, 80, &filters, fft.as_ref()).unwrap();
-        assert_eq!(mel.len(), 80 * N_FRAMES);
+        let frames = mel.len() / 80;
+        assert!(
+            frames < N_FRAMES / 4,
+            "a one-second window was padded toward 30s: {frames} frames"
+        );
+        assert!(frames >= SAMPLE_RATE / HOP_LENGTH, "{frames}");
         assert!(mel.iter().all(|value| value.is_finite()));
+        assert_eq!(decode_steps(SAMPLE_RATE), 8);
+        assert!(mean_square(&[0.0; 16]) < SPEECH_MEAN_SQUARE);
+        assert!(mean_square(&[0.2; 16]) >= SPEECH_MEAN_SQUARE);
     }
 
     #[test]
     fn reflect_pad_matches_numpy() {
         let samples = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let padded = reflect_pad(&samples, 3);
-        assert_eq!(padded, vec![3.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 8.0, 7.0, 6.0]);
+        assert_eq!(
+            padded,
+            vec![3.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 8.0, 7.0, 6.0]
+        );
         assert!(is_timestamp("<|2.00|>"));
         assert!(!is_timestamp("<|en|>"));
         assert!(!is_timestamp("<|endoftext|>"));
+    }
+
+    #[test]
+    fn a_repeated_phrase_collapses_to_one_copy() {
+        assert_eq!(
+            collapse_looped_phrase(&["ask", "not", "ask", "not"]),
+            "ask not"
+        );
+        assert_eq!(collapse_looped_phrase(&["very", "very"]), "very very");
+        assert_eq!(collapse_looped_phrase(&["no", "no", "no"]), "no");
+        assert!(spoken_loops(&[1, 2, 1, 2]));
+        assert!(!spoken_loops(&[1, 2, 3]));
     }
 
     #[test]

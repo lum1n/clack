@@ -1,10 +1,14 @@
 //! Streaming session. Silence does not end an utterance. The client commits
 //! with [`Clack::stop_listening`] or discards with [`Clack::cancel_listening`].
+//!
+//! Capture and decode run on different threads. A partial is emitted as soon as
+//! a short window has been decoded, while listening is still on. Commit publishes
+//! that text and does not run another pass over the utterance.
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 #[cfg(target_arch = "wasm32")]
 use std::sync::mpsc::{self, Receiver};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,11 +32,9 @@ const SPEAK_THRESHOLD: f32 = 0.06;
 #[cfg(not(target_arch = "wasm32"))]
 const LEVEL_GAIN: f32 = 8.0;
 /// First hypothesis, and each later one, waits for this much new audio.
+/// Commit does not decode again; it publishes the latest partial.
 #[cfg(not(target_arch = "wasm32"))]
 const MIN_NEW_SAMPLES: usize = 8_000;
-/// Force a last decode on commit when at least this much audio is new.
-#[cfg(not(target_arch = "wasm32"))]
-const FORCE_MIN_SAMPLES: usize = 1_600;
 /// Cap a segment so a held key does not grow one decode without bound.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_SEGMENT_SAMPLES: usize = 16_000 * 6;
@@ -111,8 +113,25 @@ struct WorkerMsg {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+struct DecodeRequest {
+    pcm: Vec<f32>,
+    language: LanguageMode,
+    epoch: u64,
+    end: usize,
+    capped: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct DecodeResponse {
+    epoch: u64,
+    end: usize,
+    capped: bool,
+    result: ClackResult<Hypothesis>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct Engine {
-    model: Box<dyn SpeechModel>,
+    decode_tx: Sender<DecodeRequest>,
     language: LanguageMode,
     device_id: Option<String>,
     samples: Vec<f32>,
@@ -122,6 +141,13 @@ struct Engine {
     live: String,
     listening: bool,
     external: bool,
+    /// Bumped when an utterance is replaced, so a late window is dropped.
+    epoch: u64,
+    /// Epoch of the window currently in the decoder. 0 when nothing is running.
+    inflight_epoch: u64,
+    inflight: bool,
+    /// Release already happened. Publish the in-flight window, then stop.
+    pending_commit: bool,
     level_carry: Vec<f32>,
     levels: Vec<f32>,
     activity: SpeechActivity,
@@ -136,9 +162,9 @@ struct Engine {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Engine {
-    fn new(model: Box<dyn SpeechModel>, language: LanguageMode) -> Self {
+    fn new(decode_tx: Sender<DecodeRequest>, language: LanguageMode) -> Self {
         Self {
-            model,
+            decode_tx,
             language,
             device_id: None,
             samples: Vec::new(),
@@ -148,6 +174,10 @@ impl Engine {
             live: String::new(),
             listening: false,
             external: false,
+            epoch: 1,
+            inflight_epoch: 0,
+            inflight: false,
+            pending_commit: false,
             level_carry: Vec::new(),
             levels: Vec::new(),
             activity: SpeechActivity::default(),
@@ -214,7 +244,8 @@ impl Engine {
     fn open_mic(&mut self) -> ClackResult<()> {
         self.mic = None;
         let inbox = Arc::new(Mutex::new(Vec::new()));
-        let stream = crate::devices::open_input_stream(self.device_id.as_deref(), Arc::clone(&inbox))?;
+        let stream =
+            crate::devices::open_input_stream(self.device_id.as_deref(), Arc::clone(&inbox))?;
         self.inbox = Some(inbox);
         self.mic = Some(stream);
         Ok(())
@@ -239,23 +270,52 @@ impl Engine {
     }
 
     fn stop_commit(&mut self) -> ClackResult<()> {
-        if !self.listening && self.samples.is_empty() && self.live.is_empty() && self.committed.is_empty()
+        if !self.listening
+            && !self.inflight
+            && self.samples.is_empty()
+            && self.live.is_empty()
+            && self.committed.is_empty()
         {
             self.close_mic();
             self.rest();
             return Ok(());
         }
+        // Audio that arrived after the last shown partial is not decoded.
+        // A window that has not returned yet is kept only when nothing is on
+        // screen; otherwise release commits the text that is already showing.
         self.drain_inbox();
-        self.finish_audio(true)?;
         self.close_mic();
         self.listening = false;
         self.external = false;
-        self.rest();
+        let nothing_shown = self.live.is_empty() && self.committed.is_empty();
+        if self.inflight && nothing_shown {
+            self.pending_commit = true;
+            return Ok(());
+        }
+        if self.inflight {
+            self.epoch = self.epoch.wrapping_add(1);
+            self.inflight = false;
+        }
+        self.pending_commit = true;
+        self.finish_commit();
         Ok(())
     }
 
+    fn finish_commit(&mut self) {
+        self.pending_commit = false;
+        self.emit(self.full_text(), true, false);
+        self.samples.clear();
+        self.segment_start = 0;
+        self.last_decode_len = 0;
+        self.committed.clear();
+        self.live.clear();
+        self.listening = false;
+        self.external = false;
+        self.rest();
+    }
+
     fn cancel(&mut self) -> ClackResult<()> {
-        if !self.listening && self.full_text().is_empty() {
+        if !self.listening && self.full_text().is_empty() && !self.inflight {
             self.close_mic();
             self.rest();
             return Ok(());
@@ -264,6 +324,9 @@ impl Engine {
         self.close_mic();
         self.listening = false;
         self.external = false;
+        self.pending_commit = false;
+        // The in-flight window belongs to this utterance. Drop it when it returns.
+        self.epoch = self.epoch.wrapping_add(1);
         self.samples.clear();
         self.segment_start = 0;
         self.last_decode_len = 0;
@@ -290,11 +353,13 @@ impl Engine {
             self.external = true;
         }
         self.ingest(pcm);
-        self.finish_audio(false)?;
+        self.maybe_submit();
         Ok(())
     }
 
     fn begin(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.pending_commit = false;
         self.samples.clear();
         self.segment_start = 0;
         self.last_decode_len = 0;
@@ -311,7 +376,7 @@ impl Engine {
     fn tick(&mut self) {
         self.drain_inbox();
         if self.listening {
-            let _ = self.finish_audio(false);
+            self.maybe_submit();
         }
     }
 
@@ -369,62 +434,75 @@ impl Engine {
         self.activity = SpeechActivity::default();
     }
 
-    fn finish_audio(&mut self, force: bool) -> ClackResult<()> {
-        if !self.listening && !force {
-            return Ok(());
+    /// Hand the current window to the decoder. Capture keeps appending samples.
+    fn maybe_submit(&mut self) {
+        if self.inflight || self.pending_commit || !self.listening {
+            return;
         }
-        loop {
-            let segment_len = self.samples.len().saturating_sub(self.segment_start);
-            let new_len = self.samples.len().saturating_sub(self.last_decode_len);
-            let capped = segment_len >= MAX_SEGMENT_SAMPLES;
-            let ready = new_len >= MIN_NEW_SAMPLES || (force && new_len >= FORCE_MIN_SAMPLES) || capped;
-            if !ready {
-                break;
-            }
-            let end = if capped {
-                self.segment_start + MAX_SEGMENT_SAMPLES
-            } else {
-                self.samples.len()
-            };
-            let hypothesis = self.decode_range(self.segment_start, end)?;
-            self.last_decode_len = end;
-            if hypothesis.text.is_empty() && !force && !capped {
-                break;
-            }
-            if capped {
-                self.committed = join_text(&self.committed, &hypothesis.text);
-                self.live.clear();
-                self.samples.drain(..end);
-                self.segment_start = 0;
-                self.last_decode_len = 0;
-                self.emit(self.full_text(), false, false);
-                if force && self.samples.is_empty() {
-                    break;
-                }
-                continue;
-            }
-            self.live = hypothesis.text;
-            break;
+        let segment_len = self.samples.len().saturating_sub(self.segment_start);
+        let new_len = self.samples.len().saturating_sub(self.last_decode_len);
+        let capped = segment_len >= MAX_SEGMENT_SAMPLES;
+        if segment_len == 0 || (!capped && new_len < MIN_NEW_SAMPLES) {
+            return;
         }
-        if force {
-            self.emit(self.full_text(), true, false);
-            self.samples.clear();
-            self.segment_start = 0;
-            self.last_decode_len = 0;
-            self.committed.clear();
-            self.live.clear();
-        } else if self.listening {
-            let text = self.full_text();
-            if !text.is_empty() {
-                self.emit(text, false, false);
-            }
+        let end = if capped {
+            self.segment_start + MAX_SEGMENT_SAMPLES
+        } else {
+            self.samples.len()
+        };
+        if end <= self.segment_start || end > self.samples.len() {
+            return;
         }
-        Ok(())
+        let pcm = self.samples[self.segment_start..end].to_vec();
+        let request = DecodeRequest {
+            pcm,
+            language: self.language.clone(),
+            epoch: self.epoch,
+            end,
+            capped,
+        };
+        if self.decode_tx.send(request).is_err() {
+            self.last_error = Some("decoder stopped".into());
+            return;
+        }
+        self.inflight = true;
+        self.inflight_epoch = self.epoch;
     }
 
-    fn decode_range(&mut self, start: usize, end: usize) -> ClackResult<Hypothesis> {
-        let pcm = &self.samples[start..end];
-        self.model.transcribe(pcm, &self.language)
+    fn apply_result(&mut self, response: DecodeResponse) {
+        if self.inflight && response.epoch == self.inflight_epoch {
+            self.inflight = false;
+        }
+        if response.epoch != self.epoch {
+            return;
+        }
+        let hypothesis = match response.result {
+            Ok(hypothesis) => hypothesis,
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                self.last_decode_len = response.end;
+                return;
+            }
+        };
+        self.last_decode_len = response.end;
+        if hypothesis.text.is_empty() && !response.capped {
+            return;
+        }
+        if response.capped {
+            self.committed = join_text(&self.committed, &hypothesis.text);
+            self.live.clear();
+            let end = response.end.min(self.samples.len());
+            self.samples.drain(..end);
+            self.segment_start = 0;
+            self.last_decode_len = 0;
+            self.emit(self.full_text(), false, false);
+            return;
+        }
+        self.live = hypothesis.text;
+        let text = self.full_text();
+        if !text.is_empty() && self.listening {
+            self.emit(text, false, false);
+        }
     }
 
     fn emit(&mut self, text: String, is_final: bool, cancelled: bool) {
@@ -455,7 +533,11 @@ impl Engine {
             listening: self.listening,
             transcript: if self.listening {
                 self.full_text()
-            } else if self.last_emit_key.as_ref().is_some_and(|(_, _, cancelled)| *cancelled) {
+            } else if self
+                .last_emit_key
+                .as_ref()
+                .is_some_and(|(_, _, cancelled)| *cancelled)
+            {
                 String::new()
             } else {
                 self.last_emit_key
@@ -749,24 +831,86 @@ fn worker_loop(
     cmd_rx: Receiver<WorkerMsg>,
     shared: Arc<Mutex<Shared>>,
 ) {
-    let mut engine = Engine::new(model, language);
+    let (req_tx, req_rx) = mpsc::channel::<DecodeRequest>();
+    let (resp_tx, resp_rx) = mpsc::channel::<DecodeResponse>();
+    let decoder = std::thread::Builder::new()
+        .name("clack-decode".into())
+        .spawn(move || decode_loop(model, req_rx, resp_tx));
+    let mut engine = Engine::new(req_tx, language);
+    let mut deferred_stop: Option<Sender<ClackResult<()>>> = None;
     loop {
         let incoming = cmd_rx.recv_timeout(Duration::from_millis(40));
         match incoming {
             Ok(msg) => {
+                let stop = matches!(msg.job, Job::Stop);
                 let result = engine.apply(msg.job);
+                settle(&mut engine, &resp_rx);
                 publish_mut(&mut engine, &shared);
-                if let Some(reply) = msg.reply {
+                if stop && engine.pending_commit {
+                    deferred_stop = msg.reply;
+                } else if let Some(reply) = msg.reply {
                     let _ = reply.send(result);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 engine.tick();
+                settle(&mut engine, &resp_rx);
                 publish_mut(&mut engine, &shared);
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        if !engine.pending_commit {
+            if let Some(reply) = deferred_stop.take() {
+                let _ = reply.send(Ok(()));
+            }
+        }
     }
+    drop(engine);
+    drop(resp_rx);
+    if let Ok(decoder) = decoder {
+        let _ = decoder.join();
+    }
+}
+
+fn decode_loop(
+    mut model: Box<dyn SpeechModel>,
+    req_rx: Receiver<DecodeRequest>,
+    resp_tx: Sender<DecodeResponse>,
+) {
+    while let Ok(request) = req_rx.recv() {
+        let result = model.transcribe(&request.pcm, &request.language);
+        let response = DecodeResponse {
+            epoch: request.epoch,
+            end: request.end,
+            capped: request.capped,
+            result,
+        };
+        if resp_tx.send(response).is_err() {
+            break;
+        }
+    }
+}
+
+/// Apply finished windows. A commit that is waiting on one window publishes it
+/// and does not ask for another.
+fn settle(engine: &mut Engine, resp_rx: &Receiver<DecodeResponse>) {
+    loop {
+        match resp_rx.try_recv() {
+            Ok(response) => engine.apply_result(response),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                engine.inflight = false;
+                if engine.last_error.is_none() {
+                    engine.last_error = Some("decoder stopped".into());
+                }
+                break;
+            }
+        }
+    }
+    if engine.pending_commit && !engine.inflight {
+        engine.finish_commit();
+    }
+    engine.maybe_submit();
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -781,7 +925,9 @@ fn publish_mut(engine: &mut Engine, shared: &Mutex<Shared>) {
             let extra = guard.events.len() - 128;
             guard.events.drain(..extra);
         }
-        guard.subscribers.retain(|subscriber| subscriber.send(update.clone()).is_ok());
+        guard
+            .subscribers
+            .retain(|subscriber| subscriber.send(update.clone()).is_ok());
     }
     guard.state = engine.snapshot();
 }
@@ -789,6 +935,10 @@ fn publish_mut(engine: &mut Engine, shared: &Mutex<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::sync::Condvar;
 
     struct LenModel;
 
@@ -817,20 +967,30 @@ mod tests {
         let quiet = vec![0.0_f32; 4_000];
         clack.push_audio(&quiet, 16_000).unwrap();
         std::thread::sleep(Duration::from_millis(80));
-        assert!(clack.poll().is_empty(), "4000 samples is under the first window");
-        assert!(clack.is_listening(), "silence must not end a pushed utterance");
+        assert!(
+            clack.poll().is_empty(),
+            "4000 samples is under the first window"
+        );
+        assert!(
+            clack.is_listening(),
+            "silence must not end a pushed utterance"
+        );
         clack.push_audio(&vec![0.0_f32; 8_000], 16_000).unwrap();
         std::thread::sleep(Duration::from_millis(120));
         let updates = clack.poll();
         assert!(
-            updates.iter().any(|update| update.text == "n12000" && !update.is_final),
+            updates
+                .iter()
+                .any(|update| update.text == "n12000" && !update.is_final),
             "{updates:?}"
         );
         assert!(clack.is_listening());
         clack.stop_listening().unwrap();
         let updates = clack.poll();
         assert!(
-            updates.iter().any(|update| update.text == "n12000" && update.is_final && !update.cancelled),
+            updates
+                .iter()
+                .any(|update| update.text == "n12000" && update.is_final && !update.cancelled),
             "{updates:?}"
         );
         assert!(!clack.is_listening());
@@ -846,7 +1006,9 @@ mod tests {
         clack.cancel_listening().unwrap();
         let updates = clack.poll();
         assert!(
-            updates.iter().any(|update| update.cancelled && update.is_final && update.text == "n8000"),
+            updates
+                .iter()
+                .any(|update| update.cancelled && update.is_final && update.text == "n8000"),
             "{updates:?}"
         );
         assert!(!clack.is_listening());
@@ -873,6 +1035,93 @@ mod tests {
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
+    fn stop_publishes_the_partial_and_does_not_decode_again() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clack = Clack::with_model(
+            "test/count",
+            LanguageMode::Auto,
+            Box::new(CountModel {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .unwrap();
+        clack.push_audio(&vec![0.1_f32; 8_000], 16_000).unwrap();
+        assert!(
+            wait_for(|| clack
+                .poll()
+                .iter()
+                .any(|update| !update.is_final && update.text == "n8000")),
+            "partial should arrive before stop, calls={}",
+            calls.load(Ordering::SeqCst)
+        );
+        let before = calls.load(Ordering::SeqCst);
+        clack.stop_listening().unwrap();
+        let updates = clack.poll();
+        assert!(
+            updates
+                .iter()
+                .any(|update| update.is_final && !update.cancelled && update.text == "n8000"),
+            "{updates:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "commit must not decode again"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn capture_keeps_accepting_audio_while_a_window_decodes() {
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let _unblock = Unblock(Arc::clone(&release));
+        let clack = Clack::with_model(
+            "test/gate",
+            LanguageMode::Auto,
+            Box::new(GateModel {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+        )
+        .unwrap();
+        clack.push_audio(&vec![0.2_f32; 8_000], 16_000).unwrap();
+        assert!(
+            wait_for(|| started.load(Ordering::SeqCst)),
+            "the first window should start before more audio is pushed"
+        );
+        let pushed_at = std::time::Instant::now();
+        clack.push_audio(&vec![0.2_f32; 8_000], 16_000).unwrap();
+        assert!(
+            pushed_at.elapsed() < Duration::from_millis(500),
+            "pushing audio blocked on the decoder"
+        );
+        {
+            let (lock, cv) = &*release;
+            let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+            *guard = true;
+            cv.notify_one();
+        }
+        assert!(
+            wait_for(|| {
+                clack
+                    .poll()
+                    .iter()
+                    .any(|update| !update.is_final && update.text == "n8000")
+            }),
+            "the window that was already running is the first partial"
+        );
+        assert!(
+            wait_for(|| clack.transcript() == "n16000"),
+            "audio captured during that window is decoded next, transcript={}",
+            clack.transcript()
+        );
+        clack.stop_listening().unwrap();
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn loud_audio_is_speaking_and_silence_rests() {
         let clack = session();
         clack.push_audio(&vec![0.0_f32; 8_000], 16_000).unwrap();
@@ -887,5 +1136,76 @@ mod tests {
         assert!(loud.levels.iter().any(|level| *level > SPEAK_THRESHOLD));
         clack.stop_listening().unwrap();
         assert!(!clack.speech_activity().speaking);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct CountModel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl SpeechModel for CountModel {
+        fn transcribe(
+            &mut self,
+            pcm_16k_mono: &[f32],
+            _language: &LanguageMode,
+        ) -> ClackResult<Hypothesis> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Hypothesis {
+                text: format!("n{}", pcm_16k_mono.len()),
+                language: Some("en".into()),
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct Unblock(Arc<(Mutex<bool>, Condvar)>);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl Drop for Unblock {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.0;
+            let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+            *guard = true;
+            cv.notify_one();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct GateModel {
+        started: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl SpeechModel for GateModel {
+        fn transcribe(
+            &mut self,
+            pcm_16k_mono: &[f32],
+            _language: &LanguageMode,
+        ) -> ClackResult<Hypothesis> {
+            self.started.store(true, Ordering::SeqCst);
+            let (lock, cv) = &*self.release;
+            let mut guard = lock.lock().unwrap_or_else(|err| err.into_inner());
+            while !*guard {
+                guard = cv.wait(guard).unwrap_or_else(|err| err.into_inner());
+            }
+            Ok(Hypothesis {
+                text: format!("n{}", pcm_16k_mono.len()),
+                language: Some("en".into()),
+            })
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_for(mut ready: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ready()
     }
 }
