@@ -206,8 +206,8 @@ mod linux {
         let screen_w = root_geom.width as i32;
         let (x, y, w, h) = match name {
             "Clack HUD" => {
-                let w = 420;
-                let h = 112;
+                let w = 400;
+                let h = 44;
                 ((screen_w - w) / 2, 28, w, h)
             }
             "Clack" => {

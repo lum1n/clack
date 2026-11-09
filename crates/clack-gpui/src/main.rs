@@ -4,6 +4,8 @@
 mod config;
 mod field;
 mod inject;
+#[cfg(target_os = "macos")]
+mod macos;
 mod x11;
 
 use std::time::Duration;
@@ -34,30 +36,80 @@ fn main() {
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
-        let bounds = settings_bounds(cx);
-        let _ = cx.open_window(popover_options(bounds, "Clack"), |window, cx| {
-            let desk = cx.new(|cx| Desk::new(cx));
-            let ticking = desk.clone();
-            window
-                .spawn(cx, async move |cx| {
-                    loop {
-                        Timer::after(Duration::from_millis(50)).await;
-                        let alive = cx.update(|window, app| {
-                            let request = ticking.update(app, |desk, cx| {
-                                desk.tick(window, cx);
-                                desk.take_hud_request()
-                            });
-                            apply_hud_request(app, &ticking, request);
-                        });
-                        if alive.is_err() {
-                            break;
-                        }
-                    }
-                })
-                .detach();
-            desk
-        });
+        #[cfg(target_os = "macos")]
+        {
+            // GPUI sets the regular policy in didFinishLaunching, just before
+            // this callback. Accessory keeps Clack out of the Dock and stops
+            // it becoming the active app when the HUD is shown.
+            macos::accessory_policy();
+            macos::install_status_item();
+            macos::prompt_accessibility();
+        }
+
+        let desk = cx.new(|cx| Desk::new(cx));
+        // Linux has no status item. The popover is the stand-in and opens now.
+        #[cfg(not(target_os = "macos"))]
+        open_settings(cx, &desk);
+
+        let ticking = desk.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                Timer::after(Duration::from_millis(50)).await;
+                if cx.update(|app| drive(app, &ticking)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     });
+}
+
+fn drive(cx: &mut App, desk: &Entity<Desk>) {
+    #[cfg(target_os = "macos")]
+    {
+        let listening = desk.read(cx).listening;
+        if !listening {
+            if let Some(pid) = macos::frontmost_other_pid() {
+                desk.update(cx, |desk, _cx| desk.target_pid = Some(pid));
+            }
+        }
+        let missing = !macos::is_trusted(false);
+        desk.update(cx, |desk, cx| {
+            if desk.accessibility_missing != missing {
+                desk.accessibility_missing = missing;
+                cx.notify();
+            }
+        });
+    }
+
+    if let Some(handle) = desk.read(cx).settings {
+        if handle
+            .update(cx, |desk, window, cx| {
+                desk.settings_active = window.is_window_active();
+                desk.field_focused = desk.any_field_focused(window, cx);
+                desk.commit_fields(window, cx);
+            })
+            .is_err()
+        {
+            desk.update(cx, |desk, cx| {
+                desk.settings = None;
+                desk.settings_active = false;
+                desk.field_focused = false;
+                cx.notify();
+            });
+        }
+    }
+
+    let (hud, settings) = desk.update(cx, |desk, cx| {
+        #[cfg(target_os = "macos")]
+        if macos::take_status_click() {
+            desk.pending_settings_toggle = true;
+        }
+        desk.tick(cx);
+        (desk.take_hud_request(), desk.take_settings_request())
+    });
+    apply_hud_request(cx, desk, hud);
+    apply_settings_request(cx, desk, settings);
 }
 
 struct Desk {
@@ -93,9 +145,16 @@ struct Desk {
     hud_active: bool,
     field_focused: bool,
     was_ours: bool,
+    settings: Option<WindowHandle<Desk>>,
     hud: Option<WindowHandle<Hud>>,
     preview_hud: bool,
     listening: bool,
+    #[cfg(target_os = "macos")]
+    target_pid: Option<i32>,
+    #[cfg(target_os = "macos")]
+    accessibility_missing: bool,
+    #[cfg(target_os = "macos")]
+    pending_settings_toggle: bool,
 }
 
 impl Desk {
@@ -152,15 +211,22 @@ impl Desk {
             hud_active: false,
             field_focused: false,
             was_ours: false,
+            settings: None,
             hud: None,
             preview_hud,
             listening: false,
+            #[cfg(target_os = "macos")]
+            target_pid: None,
+            #[cfg(target_os = "macos")]
+            accessibility_missing: !macos::is_trusted(false),
+            #[cfg(target_os = "macos")]
+            pending_settings_toggle: false,
         };
         desk.begin_download();
         desk
     }
 
-    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn tick(&mut self, cx: &mut Context<Self>) {
         self.poll_hotkeys(cx);
         if let Some(session) = &self.session {
             for update in session.poll() {
@@ -171,16 +237,14 @@ impl Desk {
             self.listening = session.is_listening();
         }
         self.watch.tick();
-        self.settings_active = window.is_window_active();
-        self.field_focused = self.any_field_focused(window, cx);
         let ours = self.settings_active || self.hud_active;
         if ours && !self.was_ours && !self.field_focused {
             self.watch.restore();
         }
         self.was_ours = ours;
+        self.injector.set_target(self.dictation_target());
         self.injector.flush(!self.field_focused);
         self.sync_escape();
-        self.commit_fields(window, cx);
         if let Some(download) = &self.download {
             self.progress = Some(download.progress());
             if let Some(result) = download.try_take() {
@@ -359,6 +423,46 @@ impl Desk {
             }
         } else {
             HudRequest::Keep
+        }
+    }
+
+    fn take_settings_request(&mut self) -> SettingsRequest {
+        #[cfg(target_os = "macos")]
+        if self.pending_settings_toggle {
+            self.pending_settings_toggle = false;
+            if let Some(handle) = self.settings.take() {
+                self.settings_active = false;
+                self.field_focused = false;
+                return SettingsRequest::Close(handle);
+            }
+            return SettingsRequest::Open;
+        }
+        SettingsRequest::Keep
+    }
+
+    fn dictation_target(&self) -> Option<i32> {
+        #[cfg(target_os = "macos")]
+        {
+            self.target_pid
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn accessibility_line(&self) -> Option<&'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.accessibility_missing {
+                Some(macos::ACCESSIBILITY_HINT)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
         }
     }
 
@@ -582,6 +686,7 @@ impl Render for Desk {
             "Idle".to_string()
         };
 
+        let accessibility = self.accessibility_line();
         div()
             .size_full()
             .flex()
@@ -592,6 +697,14 @@ impl Render for Desk {
             .p_3()
             .gap_2()
             .child(div().text_color(rgb(0x9a9a9a)).child(status))
+            .when(accessibility.is_some(), |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xe08080))
+                        .child(accessibility.unwrap_or("")),
+                )
+            })
             .child(label("Model"))
             .child(self.model_field.clone())
             .when(!model_line.is_empty(), |row| {
@@ -668,6 +781,19 @@ impl Render for Desk {
                         .child(self.injector.error.clone().unwrap_or_default()),
                 )
             })
+            .when(cfg!(target_os = "macos"), |row| {
+                row.child(
+                    div()
+                        .mt_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x1c1c1c))
+                        .hover(|style| style.bg(rgb(0x333333)).cursor_pointer())
+                        .child("Quit")
+                        .on_mouse_up(gpui::MouseButton::Left, |_event, _window, cx| cx.quit()),
+                )
+            })
     }
 }
 
@@ -724,6 +850,13 @@ enum HudRequest {
     Close(WindowHandle<Hud>),
 }
 
+#[allow(dead_code)]
+enum SettingsRequest {
+    Keep,
+    Open,
+    Close(WindowHandle<Desk>),
+}
+
 fn apply_hud_request(cx: &mut App, desk: &Entity<Desk>, request: HudRequest) {
     match request {
         HudRequest::Keep => {}
@@ -735,13 +868,19 @@ fn apply_hud_request(cx: &mut App, desk: &Entity<Desk>, request: HudRequest) {
         HudRequest::Open => {
             let bounds = hud_bounds(cx);
             let desk_for_view = desk.clone();
-            let Ok(handle) =
-                cx.open_window(popover_options(bounds, "Clack HUD"), move |_window, cx| {
-                    cx.new(|_| Hud { desk: desk_for_view })
-                })
-            else {
+            let Ok(handle) = cx.open_window(hud_options(bounds), move |_window, cx| {
+                cx.new(|_| Hud { desk: desk_for_view })
+            }) else {
                 return;
             };
+            #[cfg(target_os = "macos")]
+            {
+                macos::configure_hud_window();
+                macos::accessory_policy();
+                if let Some(pid) = desk.read(cx).target_pid {
+                    macos::focus_target(pid);
+                }
+            }
             let desk_for_focus = desk.clone();
             handle
                 .update(cx, |_hud, window, cx| {
@@ -796,15 +935,20 @@ impl Render for Hud {
         div()
             .size_full()
             .flex()
-            .flex_col()
-            .justify_center()
+            .flex_row()
+            .items_center()
             .gap_2()
             .px_3()
-            .py_2()
             .bg(rgb(0x101010))
             .text_color(rgb(0xf2f2f2))
             .child(wave(levels, speaking))
-            .child(div().text_sm().text_color(transcript_color).child(transcript_text))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(transcript_color)
+                    .child(transcript_text),
+            )
     }
 }
 
@@ -828,25 +972,26 @@ fn wave(levels: Vec<f32>, speaking: bool) -> impl IntoElement {
             }
         },
     )
-    .h(px(36.))
-    .w_full()
+    .h(px(18.))
+    .w(px(88.))
 }
 
 fn tail(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= 180 {
+    if chars.len() <= 48 {
         text.to_string()
     } else {
-        chars[chars.len() - 180..].iter().collect()
+        chars[chars.len() - 48..].iter().collect()
     }
 }
 
-fn popover_options(bounds: Bounds<Pixels>, title: &str) -> WindowOptions {
+fn settings_options(bounds: Bounds<Pixels>) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some(title.to_string().into()),
-            appears_transparent: false,
+            // The X11 stand-in finds this window by name.
+            title: Some("Clack".into()),
+            appears_transparent: cfg!(target_os = "macos"),
             traffic_light_position: None,
         }),
         focus: false,
@@ -858,6 +1003,62 @@ fn popover_options(bounds: Bounds<Pixels>, title: &str) -> WindowOptions {
         app_id: Some("clack".into()),
         window_decorations: Some(WindowDecorations::Client),
         ..Default::default()
+    }
+}
+
+fn hud_options(bounds: Bounds<Pixels>) -> WindowOptions {
+    // macOS opens with no titlebar at all, so the first frame has no traffic
+    // lights. Linux keeps the name so the X11 stand-in can place the window.
+    let titlebar = if cfg!(target_os = "macos") {
+        None
+    } else {
+        Some(TitlebarOptions {
+            title: Some("Clack HUD".into()),
+            appears_transparent: true,
+            traffic_light_position: None,
+        })
+    };
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar,
+        focus: false,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        app_id: Some("clack".into()),
+        window_decorations: Some(WindowDecorations::Client),
+        ..Default::default()
+    }
+}
+
+fn open_settings(cx: &mut App, desk: &Entity<Desk>) {
+    if desk.read(cx).settings.is_some() {
+        return;
+    }
+    let bounds = settings_bounds(cx);
+    let root = desk.clone();
+    let Ok(handle) = cx.open_window(settings_options(bounds), move |_window, _cx| root) else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    macos::accessory_policy();
+    desk.update(cx, |desk, cx| {
+        desk.settings = Some(handle);
+        cx.notify();
+    });
+}
+
+fn apply_settings_request(cx: &mut App, desk: &Entity<Desk>, request: SettingsRequest) {
+    match request {
+        SettingsRequest::Keep => {}
+        SettingsRequest::Close(handle) => {
+            handle
+                .update(cx, |_desk, window, _cx| window.remove_window())
+                .ok();
+        }
+        SettingsRequest::Open => open_settings(cx, desk),
     }
 }
 
@@ -874,8 +1075,8 @@ fn settings_bounds(cx: &App) -> Bounds<Pixels> {
 
 fn hud_bounds(cx: &App) -> Bounds<Pixels> {
     let screen = primary_bounds(cx);
-    let width = px(420.);
-    let height = px(112.);
+    let width = px(400.);
+    let height = px(44.);
     // Under a MacBook notch the menu bar is taller. GPUI 0.2 does not expose
     // the notch inset, so macOS uses a fixed clearance and other displays sit
     // just below a menu bar.

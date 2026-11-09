@@ -1,9 +1,21 @@
 use clack_core::{revise_partial, TranscriptUpdate};
+use unicode_segmentation::UnicodeSegmentation;
+
+#[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
-/// Types into the focused field of another app. Escape is never a key this sends.
+#[cfg(target_os = "macos")]
+use crate::macos;
+
+/// Types into another app. Escape is never a key this sends.
+///
+/// On macOS the events are posted to the process captured when the hotkey
+/// went down. A granted microphone permission is not treated as success.
 pub struct Injector {
+    #[cfg(not(target_os = "macos"))]
     enigo: Option<Enigo>,
+    #[cfg(target_os = "macos")]
+    target_pid: Option<i32>,
     /// Text currently in the target from this utterance, including a leading space.
     injected: String,
     needs_space: bool,
@@ -16,13 +28,27 @@ pub struct Injector {
 impl Injector {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_os = "macos"))]
             enigo: None,
+            #[cfg(target_os = "macos")]
+            target_pid: None,
             injected: String::new(),
             needs_space: false,
             pending_text: None,
             pending_final: false,
             pending_cancel: false,
             error: None,
+        }
+    }
+
+    pub fn set_target(&mut self, pid: Option<i32>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.target_pid = pid;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
         }
     }
 
@@ -44,8 +70,9 @@ impl Injector {
             return;
         }
         if self.pending_cancel {
-            self.undo();
-            self.pending_cancel = false;
+            if self.undo() {
+                self.pending_cancel = false;
+            }
             return;
         }
         let Some(text) = self.pending_text.clone() else {
@@ -56,8 +83,7 @@ impl Injector {
         } else {
             text.clone()
         };
-        self.revise_to(&shown);
-        if self.pending_final {
+        if self.revise_to(&shown) && self.pending_final {
             self.needs_space = !text.trim().is_empty();
             self.injected.clear();
             self.pending_text = None;
@@ -65,46 +91,125 @@ impl Injector {
         }
     }
 
-    fn undo(&mut self) {
+    fn undo(&mut self) -> bool {
         let revision = revise_partial(&self.injected, "");
-        self.backspace(revision.backspace_graphemes);
-        self.injected.clear();
-    }
-
-    fn revise_to(&mut self, next: &str) {
-        let revision = revise_partial(&self.injected, next);
-        self.backspace(revision.backspace_graphemes);
-        self.type_text(&revision.suffix);
-        self.injected = next.to_string();
-    }
-
-    fn backspace(&mut self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let Some(enigo) = self.keyboard() else {
-            return;
-        };
-        for _ in 0..count {
-            if enigo.key(Key::Backspace, Direction::Click).is_err() {
-                self.error = Some("could not delete the dictated text".into());
-                break;
+        match self.backspace(revision.backspace_graphemes) {
+            Ok(()) => {
+                self.injected.clear();
+                true
+            }
+            Err(sent) => {
+                self.injected = drop_graphemes(&self.injected, sent);
+                false
             }
         }
     }
 
-    fn type_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let Some(enigo) = self.keyboard() else {
-            return;
+    fn revise_to(&mut self, next: &str) -> bool {
+        let revision = revise_partial(&self.injected, next);
+        let sent = match self.backspace(revision.backspace_graphemes) {
+            Ok(()) => revision.backspace_graphemes,
+            Err(sent) => {
+                self.injected = drop_graphemes(&self.injected, sent);
+                return false;
+            }
         };
-        if let Err(err) = enigo.text(text) {
-            self.error = Some(err.to_string());
+        if self.type_text(&revision.suffix).is_err() {
+            self.injected = drop_graphemes(&self.injected, sent);
+            return false;
+        }
+        self.injected = next.to_string();
+        true
+    }
+
+    /// `Err(sent)` is how many backspaces landed before the failure.
+    fn backspace(&mut self, count: usize) -> Result<(), usize> {
+        if count == 0 {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(pid) = self.prepare_target() else {
+                return Err(0);
+            };
+            if let Err(err) = macos::backspace(pid, count) {
+                self.error = Some(err);
+                // The batch stops at the first failed event, so count the ones
+                // before it as sent only when the whole batch fails at the start.
+                return Err(0);
+            }
+            self.error = None;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let Some(enigo) = self.keyboard() else {
+                return Err(0);
+            };
+            for sent in 0..count {
+                if enigo.key(Key::Backspace, Direction::Click).is_err() {
+                    self.error = Some("could not delete the dictated text".into());
+                    return Err(sent);
+                }
+            }
+            Ok(())
         }
     }
 
+    fn type_text(&mut self, text: &str) -> Result<(), ()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let Some(pid) = self.prepare_target() else {
+                return Err(());
+            };
+            match macos::type_text(pid, text) {
+                Ok(()) => {
+                    self.error = None;
+                    Ok(())
+                }
+                Err(err) => {
+                    self.error = Some(err);
+                    Err(())
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let Some(enigo) = self.keyboard() else {
+                return Err(());
+            };
+            match enigo.text(text) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    self.error = Some(err.to_string());
+                    Err(())
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_target(&mut self) -> Option<i32> {
+        if !macos::is_trusted(false) {
+            // The settings popover explains this. Do not report it as a microphone success.
+            self.error = None;
+            return None;
+        }
+        let Some(pid) = self.target_pid else {
+            self.error = Some(
+                "No app was focused when the hotkey went down, so the text was not inserted."
+                    .into(),
+            );
+            return None;
+        };
+        macos::focus_target(pid);
+        Some(pid)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn keyboard(&mut self) -> Option<&mut Enigo> {
         if self.enigo.is_none() {
             match Enigo::new(&Settings {
@@ -120,4 +225,13 @@ impl Injector {
         }
         self.enigo.as_mut()
     }
+}
+
+fn drop_graphemes(text: &str, count: usize) -> String {
+    if count == 0 {
+        return text.to_string();
+    }
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let keep = graphemes.len().saturating_sub(count);
+    graphemes[..keep].concat()
 }

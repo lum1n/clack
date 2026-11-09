@@ -46,23 +46,30 @@ grabbed only while listening.
 
 The client does not type while a Clack text field is focused, and it does not
 send Escape. On X11 it remembers the window you were in and gives it focus back
-if a Clack window took it.
+if a Clack window took it. On macOS it remembers the frontmost app when the
+hotkey goes down and posts keystrokes to that process. It does not activate
+Clack to do this. Microphone permission is not enough to type.
 
 ## What you see
 
-GPUI 0.2 cannot create a system status item on Linux. The status-item type exists
-in the macOS sources and is not part of the public API. The settings UI is the
-smallest top-anchored dark popover that fits: model link, Hugging Face token,
-microphone, output language, hold hotkey, toggle hotkey. It does not take focus
-when it opens. A denied microphone permission or a missing input device is written
-in that popover.
+On macOS, Clack is a menu-bar app. It uses the accessory activation policy, so
+it has no Dock icon, and an `NSStatusItem` (a waveform symbol) sits in the menu
+bar. Click it to open the settings popover; click it again to close that
+popover. GPUI 0.2 cannot create a system status item on Linux, so on Linux the
+same popover opens at launch. The popover is the small dark window: model link,
+Hugging Face token, microphone, output language, hold hotkey, toggle hotkey. It
+does not take focus when it opens. A denied microphone permission or a missing
+input device is written in that popover. Missing Accessibility is a separate
+line. A granted microphone permission is not treated as permission to type.
 
-While listening, a second dark window sits at the top center. On a MacBook it is
-offset below the menu bar so it can clear the notch (GPUI 0.2 does not report the
-notch inset, so the offset is fixed). On other displays it sits just below the
-menu bar. It does not take focus. It draws the soundwave from the core's level
-series — the bars move while speech is detected and rest during silence — and the
-live transcript. It closes when listening stops.
+While listening, a short borderless strip sits at the top center: a soundwave
+and one transcript line, with no title and no traffic lights. On a MacBook it
+is offset below the menu bar so it can clear the notch (GPUI 0.2 does not
+report the notch inset, so the offset is fixed). On other displays it sits just
+below the menu bar. On macOS the strip is a nonactivating panel: it does not
+become key, it ignores mouse events, and showing it does not activate Clack.
+The bars move while speech is detected and rest during silence. The strip
+closes when listening stops.
 
 ## Models
 
@@ -138,9 +145,12 @@ The GPUI client uses `enigo` (X11 backend on Linux) and `global-hotkey`.
   the focused window. This is the path exercised here. Wayland is not. Global
   hotkeys and synthetic keystrokes are unreliable under Wayland, and the default
   enigo features do not speak the Wayland protocols.
-- macOS: typing needs Accessibility permission. The HUD offset aims under the
-  notch. There is still no public GPUI status item in 0.2, so the settings
-  window is the same popover.
+- macOS: typing needs Accessibility for the exact binary you launched. The
+  system prompt is shown when it is missing, and the settings popover says so.
+  Keystrokes are posted with `CGEventPostToPid` to the app that was focused
+  when the hotkey went down, after that app is activated again. Clack is not
+  activated. The menu-bar icon opens the settings popover. The listening strip
+  is borderless and sits under the notch.
 - Windows: enigo and global-hotkey have backends. They were not run here.
 
 Partials revise the unstable suffix. The client backspaces grapheme clusters, not

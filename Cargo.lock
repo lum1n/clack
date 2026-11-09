@@ -1061,9 +1061,14 @@ name = "clack-gpui"
 version = "0.1.0"
 dependencies = [
  "clack-core",
+ "cocoa 0.26.1",
+ "core-foundation 0.10.1",
+ "core-graphics 0.25.0",
  "enigo",
  "global-hotkey",
  "gpui",
+ "libc",
+ "objc",
  "serde",
  "toml 0.8.23",
  "unicode-segmentation",
