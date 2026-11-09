@@ -1,0 +1,23 @@
+[package]
+name = "clack-gpui"
+version = "0.1.0"
+edition = "2021"
+description = "Menu-bar client for Clack. Hotkeys and typing live here, not in the core."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "clack"
+path = "src/main.rs"
+
+[dependencies]
+clack-core = { path = "../clack-core" }
+enigo = "0.6"
+global-hotkey = "0.9"
+gpui = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+unicode-segmentation = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"

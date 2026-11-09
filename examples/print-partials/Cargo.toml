@@ -1,0 +1,12 @@
+[package]
+name = "print-partials"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "print-partials"
+path = "src/main.rs"
+
+[dependencies]
+clack-core = { path = "../../crates/clack-core" }

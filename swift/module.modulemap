@@ -1,0 +1,5 @@
+module ClackFFI {
+    header "../crates/clack-ffi/include/clack.h"
+    link "clack_ffi"
+    export *
+}

@@ -1,0 +1,14 @@
+[package]
+name = "clack-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WASM bindings for the Clack speech core"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+clack-core = { path = "../clack-core", default-features = false }
+wasm-bindgen = "0.2"

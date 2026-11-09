@@ -1,0 +1,23 @@
+/target
+web/pkg
+*.wav
+.DS_Store
+
+# Downloaded model weights and Hub caches
+*.safetensors
+*.onnx
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.bin
+.cache/
+**/.cache/
+huggingface/
+models--*/
+
+# Local config that can hold a Hugging Face token
+.env
+.env.*
+config.toml
+**/clack/config.toml

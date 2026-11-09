@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clack-core",
+    "crates/clack-gpui",
+    "crates/clack-ffi",
+    "crates/clack-wasm",
+    "examples/print-partials",
+]
+
+[profile.dev.package.candle-core]
+opt-level = 3
+
+[profile.dev.package.candle-nn]
+opt-level = 3
+
+[profile.dev.package.candle-transformers]
+opt-level = 3
+
+[profile.dev.package.rayon]
+opt-level = 3
+
+# xattr 0.2.3 (pulled in by GPUI) still names libc::ENOATTR, which current libc
+# does not provide on Linux. The copy under third_party only fixes that constant.
+[patch.crates-io]
+xattr = { path = "third_party/xattr" }
