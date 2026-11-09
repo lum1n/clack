@@ -165,7 +165,12 @@ pub fn configure_hud_window() {
                     | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle
                     | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
             );
-            let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: YES];
+            // NSStatusBarWindow does not implement this. Only NSPanel does.
+            let selector = sel!(setBecomesKeyOnlyIfNeeded:);
+            let responds: BOOL = msg_send![window, respondsToSelector: selector];
+            if responds == YES {
+                let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: YES];
+            }
             window.setFrame_display_(frame, YES);
             window.orderFront_(nil);
             if window.isKeyWindow() == YES {
@@ -244,13 +249,41 @@ fn utf16_chunks(text: &str, limit: usize) -> Vec<&str> {
 }
 
 fn is_hud_window(window: id) -> bool {
+    // The menu-bar item's window is a short NSStatusBarWindow. It is not the HUD,
+    // and it is not an NSPanel. Height alone matches it and then crashes.
+    if window.is_null() || is_status_item_window(window) || !is_gpui_panel(window) {
+        return false;
+    }
     if title_eq(window, HUD_TITLE) {
         return true;
     }
-    // The strip is 44pt. The settings popover is 640pt, so a short panel is the HUD
-    // even when it was opened with no title.
+    // GPUI's popup class is GPUIPanel. The strip is 44pt; the settings popover is 640pt.
     let frame = unsafe { NSWindow::frame(window) };
     frame.size.height > 20.0 && frame.size.height < 120.0
+}
+
+fn is_status_item_window(window: id) -> bool {
+    class_chain(window, |name| name.contains("StatusBar"))
+}
+
+fn is_gpui_panel(window: id) -> bool {
+    class_chain(window, |name| name == "GPUIPanel")
+}
+
+fn class_chain(window: id, mut matches: impl FnMut(&str) -> bool) -> bool {
+    unsafe {
+        if window.is_null() {
+            return false;
+        }
+        let mut class = Some((*window).class());
+        while let Some(current) = class {
+            if matches(current.name()) {
+                return true;
+            }
+            class = current.superclass();
+        }
+        false
+    }
 }
 
 fn frontmost_pid() -> Option<i32> {
