@@ -57,44 +57,72 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        // Feed the file in short windows. A partial has to show up before the
-        // last window is pushed. Release only commits; it does not decode again.
+        // Feed the file in pieces longer than one decode window. The opening
+        // words have to still be in the transcript after a later window lands.
         let chunk = 16_000 * 2;
         let mut offset = 0;
-        let mut saw_partial = false;
         while offset < pcm.len() {
             let end = (offset + chunk).min(pcm.len());
-            let last = end == pcm.len();
-            if last && saw_partial {
-                println!("partial arrived before the final chunk");
-            }
             if let Err(err) = session.push_audio(&pcm[offset..end], 16_000) {
                 eprintln!("{err}");
                 return ExitCode::from(1);
             }
             offset = end;
-            if last {
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let mut opening = String::new();
+        let mut grew = false;
+        while std::time::Instant::now() < deadline {
+            for update in session.poll() {
+                if update.cancelled || update.text.is_empty() {
+                    continue;
+                }
+                println!(
+                    "{} {}",
+                    if update.is_final { "final" } else { "partial" },
+                    update.text
+                );
+                if opening.is_empty() && !update.is_final {
+                    opening = first_words(&update.text, 2);
+                }
+            }
+            let transcript = session.transcript();
+            if !opening.is_empty()
+                && transcript.starts_with(opening.trim())
+                && transcript.split_whitespace().count() > opening.split_whitespace().count()
+            {
+                grew = true;
                 break;
             }
-            let deadline = std::time::Instant::now() + Duration::from_secs(180);
-            while !saw_partial && std::time::Instant::now() < deadline {
-                if print_updates(&session) {
-                    saw_partial = true;
-                }
-                if !saw_partial {
-                    std::thread::sleep(Duration::from_millis(30));
-                }
-            }
-            if !saw_partial {
-                eprintln!("no partial before the rest of the file");
-                return ExitCode::from(1);
-            }
+            std::thread::sleep(Duration::from_millis(40));
         }
+        if opening.is_empty() {
+            eprintln!("no partial before the later audio");
+            return ExitCode::from(1);
+        }
+        if !grew {
+            eprintln!(
+                "transcript did not keep the opening and add later words: {opening:?} -> {}",
+                session.transcript()
+            );
+            return ExitCode::from(1);
+        }
+        println!("opening still present after a later window: {opening}");
         if let Err(err) = session.stop_listening() {
             eprintln!("{err}");
             return ExitCode::from(1);
         }
-        print_updates(&session);
+        for update in session.poll() {
+            println!(
+                "{} {}",
+                if update.is_final { "final" } else { "partial" },
+                update.text
+            );
+            if update.is_final && !update.cancelled && !update.text.starts_with(opening.trim()) {
+                eprintln!("final dropped the opening: {}", update.text);
+                return ExitCode::from(1);
+            }
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -126,20 +154,11 @@ fn main() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn print_updates(session: &Clack) -> bool {
-    let mut saw_partial = false;
-    for update in session.poll() {
-        if !update.is_final && !update.cancelled && !update.text.is_empty() {
-            saw_partial = true;
-        }
-        println!(
-            "{} {}{}",
-            if update.is_final { "final" } else { "partial" },
-            if update.cancelled { "(cancelled) " } else { "" },
-            update.text
-        );
-    }
-    saw_partial
+fn first_words(text: &str, count: usize) -> String {
+    text.split_whitespace()
+        .take(count)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
