@@ -1,10 +1,9 @@
 //! Streaming session. Silence does not end an utterance. The client commits
 //! with [`Clack::stop_listening`] or discards with [`Clack::cancel_listening`].
 //!
-//! Capture and decode run on different threads. A partial is emitted as soon as
-//! a short window has been decoded, while listening is still on. Words already
-//! committed stay put; only the latest window's tail can change. The next window
-//! is appended. Release publishes that text and does not decode the utterance again.
+//! Capture and decode run on different threads. A partial is for the listening
+//! view only. Release waits until one pass over the whole utterance is finished,
+//! then publishes that text. Nothing is typed from a partial.
 
 #[cfg(target_arch = "wasm32")]
 use std::sync::mpsc::{self, Receiver};
@@ -32,21 +31,15 @@ const LEVEL_CHUNK: usize = 800;
 const SPEAK_THRESHOLD: f32 = 0.06;
 #[cfg(not(target_arch = "wasm32"))]
 const LEVEL_GAIN: f32 = 8.0;
-/// First hypothesis, and each later one, waits for this much new audio.
-/// Release does not decode again; it publishes the text already built.
+/// A listening preview waits for this much new audio. It is not typed.
 #[cfg(not(target_arch = "wasm32"))]
 const MIN_NEW_SAMPLES: usize = 8_000;
-/// A window is frozen and the next one starts after this much audio.
-/// The frozen words are the stable prefix. They are not decoded again.
+/// The HUD decodes this much recent audio. The field is not typed from it.
 #[cfg(not(target_arch = "wasm32"))]
-const COMMIT_SAMPLES: usize = 16_000 * 3;
-/// Audio kept so the next window can finish a word that crossed the boundary.
+const PREVIEW_SAMPLES: usize = 16_000 * 4;
+/// One Whisper pass. The release transcript is this much audio, from the start.
 #[cfg(not(target_arch = "wasm32"))]
-const OVERLAP_SAMPLES: usize = 8_000;
-/// Words at the end of the current window. A new hypothesis may rewrite these
-/// and nothing earlier.
-#[cfg(not(target_arch = "wasm32"))]
-const UNSTABLE_WORDS: usize = 2;
+const MAX_UTTERANCE_SAMPLES: usize = 16_000 * 30;
 
 /// Levels for a soundwave. `speaking` is true only while listening and recent
 /// audio is above a small RMS. Silence is a resting wave, not the end of the utterance.
@@ -127,15 +120,18 @@ struct DecodeRequest {
     language: LanguageMode,
     epoch: u64,
     end: usize,
-    /// The window is full. Its text is frozen and the next window appends.
-    roll: bool,
+    /// This pcm is the whole captured utterance, not a short preview.
+    covers_whole: bool,
+    /// The release pass over the audio captured for this utterance.
+    final_pass: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 struct DecodeResponse {
     epoch: u64,
     end: usize,
-    roll: bool,
+    covers_whole: bool,
+    final_pass: bool,
     result: ClackResult<Hypothesis>,
 }
 
@@ -145,9 +141,15 @@ struct Engine {
     language: LanguageMode,
     device_id: Option<String>,
     samples: Vec<f32>,
-    segment_start: usize,
+    /// Samples included in the last decode that finished.
     last_decode_len: usize,
-    committed: String,
+    /// Samples the decoder is working on now. 0 when nothing is running.
+    inflight_end: usize,
+    /// The release pass has been handed to the decoder.
+    final_sent: bool,
+    /// The latest finished decode was the whole utterance.
+    have_whole: bool,
+    /// Preview text for the listening view. The typed string is the final pass.
     live: String,
     listening: bool,
     external: bool,
@@ -178,9 +180,10 @@ impl Engine {
             language,
             device_id: None,
             samples: Vec::new(),
-            segment_start: 0,
             last_decode_len: 0,
-            committed: String::new(),
+            inflight_end: 0,
+            final_sent: false,
+            have_whole: false,
             live: String::new(),
             listening: false,
             external: false,
@@ -202,7 +205,11 @@ impl Engine {
     }
 
     fn full_text(&self) -> String {
-        join_text(&self.committed, &self.live)
+        normalize_ws(&self.live)
+    }
+
+    fn utterance_end(&self) -> usize {
+        self.samples.len().min(MAX_UTTERANCE_SAMPLES)
     }
 
     fn apply(&mut self, job: Job) -> ClackResult<()> {
@@ -280,36 +287,42 @@ impl Engine {
     }
 
     fn stop_commit(&mut self) -> ClackResult<()> {
-        if !self.listening
-            && !self.inflight
-            && self.samples.is_empty()
-            && self.live.is_empty()
-            && self.committed.is_empty()
-        {
+        if !self.listening && !self.inflight && self.samples.is_empty() && self.live.is_empty() {
             self.close_mic();
             self.rest();
             return Ok(());
         }
-        // Release freezes the text already built. An in-flight window may finish
-        // and append; nothing starts a new pass over the whole utterance.
+        // Release does not type the preview. It waits for one pass over the
+        // audio captured so far, then publishes that single transcript.
         self.drain_inbox();
         self.close_mic();
         self.listening = false;
         self.external = false;
+        self.rest();
         self.pending_commit = true;
-        if !self.inflight {
+        let end = self.utterance_end();
+        if end == 0 {
             self.finish_commit();
+            return Ok(());
+        }
+        if !self.inflight && self.have_whole && self.last_decode_len >= end {
+            self.finish_commit();
+            return Ok(());
+        }
+        if !self.inflight {
+            self.submit_final();
         }
         Ok(())
     }
 
     fn finish_commit(&mut self) {
         self.pending_commit = false;
+        self.final_sent = false;
+        self.have_whole = false;
         self.emit(self.full_text(), true, false);
         self.samples.clear();
-        self.segment_start = 0;
         self.last_decode_len = 0;
-        self.committed.clear();
+        self.inflight_end = 0;
         self.live.clear();
         self.listening = false;
         self.external = false;
@@ -330,9 +343,10 @@ impl Engine {
         // The in-flight window belongs to this utterance. Drop it when it returns.
         self.epoch = self.epoch.wrapping_add(1);
         self.samples.clear();
-        self.segment_start = 0;
         self.last_decode_len = 0;
-        self.committed.clear();
+        self.inflight_end = 0;
+        self.final_sent = false;
+        self.have_whole = false;
         self.live.clear();
         self.rest();
         self.emit(discarded, true, true);
@@ -363,9 +377,10 @@ impl Engine {
         self.epoch = self.epoch.wrapping_add(1);
         self.pending_commit = false;
         self.samples.clear();
-        self.segment_start = 0;
         self.last_decode_len = 0;
-        self.committed.clear();
+        self.inflight_end = 0;
+        self.final_sent = false;
+        self.have_whole = false;
         self.live.clear();
         self.level_carry.clear();
         self.levels.clear();
@@ -396,6 +411,7 @@ impl Engine {
 
     fn ingest(&mut self, pcm: &[f32]) {
         self.samples.extend_from_slice(pcm);
+        self.have_whole = false;
         self.push_levels(pcm);
     }
 
@@ -436,78 +452,100 @@ impl Engine {
         self.activity = SpeechActivity::default();
     }
 
-    /// Hand the current window to the decoder. Capture keeps appending samples.
-    /// The window is only the audio since the last frozen prefix, not the whole utterance.
+    /// Preview the audio so far for the listening view. The field is not typed.
     fn maybe_submit(&mut self) {
-        if self.inflight || self.pending_commit || !self.listening {
+        if self.inflight || self.pending_commit || self.final_sent || !self.listening {
             return;
         }
-        let start = self.segment_start;
-        if start > self.samples.len() {
+        let end = self.utterance_end();
+        if end == 0 || end.saturating_sub(self.last_decode_len) < MIN_NEW_SAMPLES {
             return;
         }
-        let limit = start.saturating_add(COMMIT_SAMPLES).min(self.samples.len());
-        let new_len = limit.saturating_sub(self.last_decode_len.max(start));
-        if limit <= start || new_len < MIN_NEW_SAMPLES {
+        let start = end.saturating_sub(PREVIEW_SAMPLES);
+        self.send_decode(start, end, false);
+    }
+
+    /// One pass over the captured utterance. Its text is what gets typed.
+    fn submit_final(&mut self) {
+        if self.final_sent {
             return;
         }
-        let pcm = self.samples[start..limit].to_vec();
+        let end = self.utterance_end();
+        if end == 0 {
+            self.finish_commit();
+            return;
+        }
+        self.final_sent = true;
+        self.send_decode(0, end, true);
+    }
+
+    fn send_decode(&mut self, start: usize, end: usize, final_pass: bool) {
+        let start = start.min(end);
+        let pcm = self.samples[start..end].to_vec();
         let request = DecodeRequest {
             pcm,
             language: self.language.clone(),
             epoch: self.epoch,
-            end: limit,
-            roll: limit.saturating_sub(start) >= COMMIT_SAMPLES,
+            end,
+            covers_whole: final_pass || (start == 0 && end == self.utterance_end()),
+            final_pass,
         };
         if self.decode_tx.send(request).is_err() {
             self.last_error = Some("decoder stopped".into());
+            if self.pending_commit {
+                self.finish_commit();
+            }
             return;
         }
         self.inflight = true;
         self.inflight_epoch = self.epoch;
+        self.inflight_end = end;
     }
 
     fn apply_result(&mut self, response: DecodeResponse) {
         if self.inflight && response.epoch == self.inflight_epoch {
             self.inflight = false;
+            self.inflight_end = 0;
         }
         if response.epoch != self.epoch {
+            if self.pending_commit && !self.inflight {
+                self.submit_final();
+            }
             return;
         }
         let hypothesis = match response.result {
             Ok(hypothesis) => hypothesis,
             Err(err) => {
                 self.last_error = Some(err.to_string());
-                self.last_decode_len = response.end;
+                if self.pending_commit && !response.final_pass {
+                    self.submit_final();
+                } else if self.pending_commit {
+                    self.finish_commit();
+                }
                 return;
             }
         };
         self.last_decode_len = response.end;
-        let fresh = strip_repeated_prefix(&self.committed, &hypothesis.text);
-        if !fresh.is_empty() {
-            // Revise the open window only. `committed` is not an argument, so it cannot move.
-            self.live = merge_transcript(&self.live, &fresh, UNSTABLE_WORDS);
+        if !hypothesis.text.is_empty() {
+            self.live = hypothesis.text;
         }
-        if response.roll {
-            if !self.live.is_empty() {
-                self.committed = join_text(&self.committed, &self.live);
-                self.live.clear();
-            }
-            self.slide_window(response.end);
+        let whole =
+            response.final_pass || (response.covers_whole && response.end >= self.utterance_end());
+        if whole {
+            self.have_whole = true;
+        }
+        if self.pending_commit && whole {
+            self.finish_commit();
+            return;
+        }
+        if self.pending_commit {
+            self.submit_final();
+            return;
         }
         let text = self.full_text();
         if !text.is_empty() && self.listening {
             self.emit(text, false, false);
         }
-    }
-
-    /// Drop audio whose words are already in `committed`. Keep a short overlap.
-    fn slide_window(&mut self, end: usize) {
-        let end = end.min(self.samples.len());
-        let keep_from = end.saturating_sub(OVERLAP_SAMPLES);
-        self.samples.drain(..keep_from);
-        self.segment_start = 0;
-        self.last_decode_len = end - keep_from;
     }
 
     fn emit(&mut self, text: String, is_final: bool, cancelled: bool) {
@@ -535,8 +573,10 @@ impl Engine {
 impl Engine {
     fn snapshot(&self) -> PublicState {
         PublicState {
-            listening: self.listening,
-            transcript: if self.listening {
+            // Stay "listening" until the release pass is published, so the HUD
+            // can keep the preview up. The microphone is already closed.
+            listening: self.listening || self.pending_commit,
+            transcript: if self.listening || self.pending_commit {
                 self.full_text()
             } else if self
                 .last_emit_key
@@ -560,74 +600,8 @@ impl Engine {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn join_text(committed: &str, live: &str) -> String {
-    let committed = normalize_ws(committed);
-    let live = normalize_ws(live);
-    match (committed.is_empty(), live.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => committed,
-        (true, false) => live,
-        (false, false) => format!("{committed} {live}"),
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn normalize_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn words(text: &str) -> Vec<&str> {
-    text.split_whitespace().collect()
-}
-
-/// Drop a leading copy of the committed suffix. The overlap audio repeats it.
-fn strip_repeated_prefix(committed: &str, hypothesis: &str) -> String {
-    let committed_words = words(committed);
-    let hyp_words = words(hypothesis);
-    let max = committed_words.len().min(hyp_words.len());
-    let mut overlap = 0;
-    for len in (1..=max).rev() {
-        if committed_words[committed_words.len() - len..] == hyp_words[..len] {
-            overlap = len;
-            break;
-        }
-    }
-    hyp_words[overlap..].join(" ")
-}
-
-/// Merge one window's new hypothesis into that window's previous tail.
-///
-/// A longer hypothesis that still starts with the same words extends the tail.
-/// A change past the last [`UNSTABLE_WORDS`] does not discard the earlier words;
-/// the new wording is appended instead.
-fn merge_transcript(previous: &str, hypothesis: &str, unstable_words: usize) -> String {
-    let previous = normalize_ws(previous);
-    let hypothesis = normalize_ws(hypothesis);
-    if previous.is_empty() {
-        return hypothesis;
-    }
-    if hypothesis.is_empty() {
-        return previous;
-    }
-    let prev = words(&previous);
-    let next = words(&hypothesis);
-    let mut shared = 0;
-    while shared < prev.len() && shared < next.len() && prev[shared] == next[shared] {
-        shared += 1;
-    }
-    if shared == prev.len() {
-        return next.join(" ");
-    }
-    let stable_guard = prev.len().saturating_sub(unstable_words);
-    if shared >= stable_guard {
-        return next.join(" ");
-    }
-    let novel = next[shared..].join(" ");
-    if novel.is_empty() {
-        previous
-    } else {
-        join_text(&previous, &novel)
-    }
 }
 
 /// The embeddable session. On wasm32 the constructor reports that Whisper
@@ -708,7 +682,8 @@ impl Clack {
         self.call(Job::StartMic)
     }
 
-    /// Commit the current transcript and stop.
+    /// Close the microphone. The final transcript arrives when one pass over
+    /// the whole utterance has finished. Previews are not that text.
     pub fn stop_listening(&self) -> ClackResult<()> {
         self.call(Job::Stop)
     }
@@ -896,18 +871,14 @@ fn worker_loop(
         .name("clack-decode".into())
         .spawn(move || decode_loop(model, req_rx, resp_tx));
     let mut engine = Engine::new(req_tx, language);
-    let mut deferred_stop: Option<Sender<ClackResult<()>>> = None;
     loop {
         let incoming = cmd_rx.recv_timeout(Duration::from_millis(40));
         match incoming {
             Ok(msg) => {
-                let stop = matches!(msg.job, Job::Stop);
                 let result = engine.apply(msg.job);
                 settle(&mut engine, &resp_rx);
                 publish_mut(&mut engine, &shared);
-                if stop && engine.pending_commit {
-                    deferred_stop = msg.reply;
-                } else if let Some(reply) = msg.reply {
+                if let Some(reply) = msg.reply {
                     let _ = reply.send(result);
                 }
             }
@@ -917,11 +888,6 @@ fn worker_loop(
                 publish_mut(&mut engine, &shared);
             }
             Err(RecvTimeoutError::Disconnected) => break,
-        }
-        if !engine.pending_commit {
-            if let Some(reply) = deferred_stop.take() {
-                let _ = reply.send(Ok(()));
-            }
         }
     }
     drop(engine);
@@ -941,7 +907,8 @@ fn decode_loop(
         let response = DecodeResponse {
             epoch: request.epoch,
             end: request.end,
-            roll: request.roll,
+            covers_whole: request.covers_whole,
+            final_pass: request.final_pass,
             result,
         };
         if resp_tx.send(response).is_err() {
@@ -950,8 +917,8 @@ fn decode_loop(
     }
 }
 
-/// Apply finished windows. A commit that is waiting on one window publishes it
-/// and does not ask for another.
+/// Apply a finished decode. A release that is still waiting starts the pass
+/// over the whole utterance, then publishes that text.
 fn settle(engine: &mut Engine, resp_rx: &Receiver<DecodeResponse>) {
     loop {
         match resp_rx.try_recv() {
@@ -1045,12 +1012,14 @@ mod tests {
         );
         assert!(clack.is_listening());
         clack.stop_listening().unwrap();
-        let updates = clack.poll();
         assert!(
-            updates
-                .iter()
-                .any(|update| update.text == "n12000" && update.is_final && !update.cancelled),
-            "{updates:?}"
+            wait_for(|| {
+                clack
+                    .poll()
+                    .iter()
+                    .any(|update| update.text == "n12000" && update.is_final && !update.cancelled)
+            }),
+            "final should be the whole buffer"
         );
         assert!(!clack.is_listening());
     }
@@ -1081,13 +1050,20 @@ mod tests {
         clack.push_audio(&vec![0.2_f32; 48_000], 48_000).unwrap();
         std::thread::sleep(Duration::from_millis(150));
         clack.stop_listening().unwrap();
-        let updates = clack.poll();
-        let final_text = updates
-            .iter()
-            .rev()
-            .find(|update| update.is_final && !update.cancelled)
-            .map(|update| update.text.clone())
-            .unwrap_or_default();
+        let mut final_text = String::new();
+        assert!(
+            wait_for(|| {
+                final_text = clack
+                    .poll()
+                    .into_iter()
+                    .rev()
+                    .find(|update| update.is_final && !update.cancelled)
+                    .map(|update| update.text.clone())
+                    .unwrap_or_default();
+                !final_text.is_empty()
+            }),
+            "final transcript missing"
+        );
         let count: usize = final_text.trim_start_matches('n').parse().unwrap_or(0);
         assert!((15_992..=16_008).contains(&count), "{final_text}");
     }
@@ -1116,12 +1092,14 @@ mod tests {
         );
         let before = calls.load(Ordering::SeqCst);
         clack.stop_listening().unwrap();
-        let updates = clack.poll();
         assert!(
-            updates
-                .iter()
-                .any(|update| update.is_final && !update.cancelled && update.text == "n8000"),
-            "{updates:?}"
+            wait_for(|| {
+                clack
+                    .poll()
+                    .iter()
+                    .any(|update| update.is_final && !update.cancelled && update.text == "n8000")
+            }),
+            "final should be the preview that already covered every sample"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1199,89 +1177,46 @@ mod tests {
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn a_later_window_appends_and_the_opening_stays() {
+    fn release_types_one_transcript_of_the_whole_utterance() {
         let clack =
-            Clack::with_model("test/chunks", LanguageMode::Auto, Box::new(ChunkModel)).unwrap();
-        clack
-            .push_audio(&vec![0.1_f32; COMMIT_SAMPLES], 16_000)
-            .unwrap();
-        assert!(
-            wait_for(|| clack.transcript().contains("opening words")),
-            "first window missing, transcript={}",
-            clack.transcript()
-        );
-        let opening = clack.transcript();
-        clack
-            .push_audio(&vec![0.8_f32; COMMIT_SAMPLES], 16_000)
-            .unwrap();
+            Clack::with_model("test/whole", LanguageMode::Auto, Box::new(LenModel)).unwrap();
+        clack.push_audio(&vec![0.1_f32; 8_000], 16_000).unwrap();
         assert!(
             wait_for(|| {
-                let text = clack.transcript();
-                text.contains("opening words") && text.contains("later words")
+                clack
+                    .poll()
+                    .iter()
+                    .any(|update| !update.is_final && update.text == "n8000")
             }),
-            "later window replaced the opening, transcript={}",
-            clack.transcript()
+            "a preview should arrive while listening"
         );
+        clack.push_audio(&vec![0.2_f32; 24_000], 16_000).unwrap();
         clack.stop_listening().unwrap();
-        let final_text = clack
-            .poll()
-            .into_iter()
-            .rev()
-            .find(|update| update.is_final && !update.cancelled)
-            .map(|update| update.text)
-            .unwrap_or_default();
+        let mut finals = Vec::new();
+        let mut partials_after = Vec::new();
         assert!(
-            final_text.contains("opening words") && final_text.contains("later words"),
-            "opening={opening:?} final={final_text:?}"
+            wait_for(|| {
+                for update in clack.poll() {
+                    if update.cancelled {
+                        continue;
+                    }
+                    if update.is_final {
+                        finals.push(update.text);
+                    } else {
+                        partials_after.push(update.text);
+                    }
+                }
+                !finals.is_empty()
+            }),
+            "the release transcript never arrived"
         );
+        assert_eq!(finals, vec!["n32000".to_string()]);
+        let injected: Vec<&str> = finals.iter().map(String::as_str).collect();
+        assert_eq!(injected, ["n32000"]);
         assert!(
-            final_text.starts_with("opening"),
-            "stable prefix moved: {final_text}"
+            partials_after.iter().all(|text| text != "n8000 n24000"),
+            "partials must not be glued together: {partials_after:?}"
         );
-    }
-
-    #[test]
-    #[cfg(not(target_arch = "wasm32"))]
-    fn merge_keeps_a_stable_prefix_and_revises_the_tail() {
-        assert_eq!(
-            merge_transcript("alpha beta gamma delta", "alpha beta gamma epsilon", 2),
-            "alpha beta gamma epsilon"
-        );
-        assert_eq!(
-            merge_transcript("alpha beta gamma delta", "later words", 2),
-            "alpha beta gamma delta later words"
-        );
-        assert_eq!(
-            merge_transcript("alpha beta", "alpha beta gamma", 2),
-            "alpha beta gamma"
-        );
-        assert_eq!(
-            strip_repeated_prefix("opening words stay", "stay later words"),
-            "later words"
-        );
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    struct ChunkModel;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    impl SpeechModel for ChunkModel {
-        fn transcribe(
-            &mut self,
-            pcm_16k_mono: &[f32],
-            _language: &LanguageMode,
-        ) -> ClackResult<Hypothesis> {
-            let loud = pcm_16k_mono.iter().filter(|sample| **sample > 0.4).count() * 2
-                > pcm_16k_mono.len();
-            Ok(Hypothesis {
-                text: if loud {
-                    "later words".into()
-                } else {
-                    "opening words".into()
-                },
-                language: Some("en".into()),
-            })
-        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

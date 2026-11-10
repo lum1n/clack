@@ -54,14 +54,20 @@ impl Injector {
 
     pub fn note(&mut self, update: &TranscriptUpdate) {
         if update.cancelled {
-            self.pending_cancel = true;
             self.pending_text = None;
             self.pending_final = false;
+            // Previews are never typed, so a cancel has nothing to backspace
+            // unless a finished utterance is still sitting in the field.
+            self.pending_cancel = !self.injected.is_empty();
+            return;
+        }
+        // Partials update the HUD only. The field gets one insert, on release.
+        if !update.is_final || update.text.trim().is_empty() {
             return;
         }
         self.pending_cancel = false;
         self.pending_text = Some(update.text.clone());
-        self.pending_final = update.is_final;
+        self.pending_final = true;
     }
 
     /// `allow` is false while a Clack text field is focused. The pending edit waits.
@@ -234,4 +240,34 @@ fn drop_graphemes(text: &str, count: usize) -> String {
     let graphemes: Vec<&str> = text.graphemes(true).collect();
     let keep = graphemes.len().saturating_sub(count);
     graphemes[..keep].concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use clack_core::TranscriptUpdate;
+
+    use super::*;
+
+    fn update(text: &str, is_final: bool) -> TranscriptUpdate {
+        TranscriptUpdate {
+            id: 1,
+            text: text.into(),
+            is_final,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn previews_are_not_typed_and_the_final_is_one_insert() {
+        let mut injector = Injector::new();
+        injector.note(&update("Og så", false));
+        injector.note(&update("Og så amerikansk", false));
+        assert!(injector.pending_text.is_none());
+        assert!(injector.injected.is_empty());
+        injector.note(&update("And so my fellow Americans", true));
+        let next = injector.pending_text.clone().unwrap();
+        let revision = revise_partial(&injector.injected, &next);
+        assert_eq!(revision.backspace_graphemes, 0);
+        assert_eq!(revision.suffix, "And so my fellow Americans");
+    }
 }

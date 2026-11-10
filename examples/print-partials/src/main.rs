@@ -57,8 +57,8 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        // Feed the file in pieces longer than one decode window. The opening
-        // words have to still be in the transcript after a later window lands.
+        // Feed the whole clip. Previews may print. The only string that would
+        // be typed is the one final transcript of the whole utterance.
         let chunk = 16_000 * 2;
         let mut offset = 0;
         while offset < pcm.len() {
@@ -70,59 +70,53 @@ fn main() -> ExitCode {
             offset = end;
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        let mut opening = String::new();
-        let mut grew = false;
-        while std::time::Instant::now() < deadline {
+        let mut saw_partial = false;
+        while !saw_partial && std::time::Instant::now() < deadline {
             for update in session.poll() {
                 if update.cancelled || update.text.is_empty() {
                     continue;
                 }
-                println!(
-                    "{} {}",
-                    if update.is_final { "final" } else { "partial" },
-                    update.text
-                );
-                if opening.is_empty() && !update.is_final {
-                    opening = first_words(&update.text, 2);
+                if update.is_final {
+                    eprintln!("a final arrived before release: {}", update.text);
+                    return ExitCode::from(1);
                 }
+                println!("partial {}", update.text);
+                saw_partial = true;
             }
-            let transcript = session.transcript();
-            if !opening.is_empty()
-                && transcript.starts_with(opening.trim())
-                && transcript.split_whitespace().count() > opening.split_whitespace().count()
-            {
-                grew = true;
-                break;
+            if !saw_partial {
+                std::thread::sleep(Duration::from_millis(40));
             }
-            std::thread::sleep(Duration::from_millis(40));
         }
-        if opening.is_empty() {
-            eprintln!("no partial before the later audio");
+        if !saw_partial {
+            eprintln!("no preview before release");
             return ExitCode::from(1);
         }
-        if !grew {
-            eprintln!(
-                "transcript did not keep the opening and add later words: {opening:?} -> {}",
-                session.transcript()
-            );
-            return ExitCode::from(1);
-        }
-        println!("opening still present after a later window: {opening}");
         if let Err(err) = session.stop_listening() {
             eprintln!("{err}");
             return ExitCode::from(1);
         }
-        for update in session.poll() {
-            println!(
-                "{} {}",
-                if update.is_final { "final" } else { "partial" },
-                update.text
-            );
-            if update.is_final && !update.cancelled && !update.text.starts_with(opening.trim()) {
-                eprintln!("final dropped the opening: {}", update.text);
-                return ExitCode::from(1);
+        let mut injected = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while injected.is_empty() && std::time::Instant::now() < deadline {
+            for update in session.poll() {
+                if update.cancelled || update.text.is_empty() {
+                    continue;
+                }
+                if update.is_final {
+                    injected.push(update.text);
+                } else {
+                    println!("partial {}", update.text);
+                }
+            }
+            if injected.is_empty() {
+                std::thread::sleep(Duration::from_millis(40));
             }
         }
+        if injected.len() != 1 {
+            eprintln!("expected one injected transcript, got {injected:?}");
+            return ExitCode::from(1);
+        }
+        println!("injected {}", injected[0]);
         return ExitCode::SUCCESS;
     }
 
@@ -152,13 +146,6 @@ fn main() -> ExitCode {
 
     eprintln!("--run needs --wav file.wav or --mic");
     ExitCode::from(2)
-}
-
-fn first_words(text: &str, count: usize) -> String {
-    text.split_whitespace()
-        .take(count)
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
